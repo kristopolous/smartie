@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import pyemvue as pyem, sys, time, asyncio, json, os
+import pyemvue as pyem, sys, asyncio, json, os
 from kasa import Discover, Device
 action = None
 KASA_CACHE = os.path.join(os.path.dirname(__file__) or ".", "kasa_cache.json")
