@@ -108,7 +108,7 @@ def show_dev():
         else:
             on = obj.is_on
             name = obj.alias
-        print("    {} {}".format(i, '\u25A3' if on else '\u25A2', name))
+        print("    {} {} {}".format(i, '\u25A3' if on else '\u25A2', name))
     print()
 
 show_dev()
