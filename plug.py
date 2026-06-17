@@ -120,5 +120,5 @@ if len(sys.argv) == 1:
         try:
             process(input("> "))
         except:
-            print("Alright! Bye bye")
+            print("\nAlright! Bye bye")
             sys.exit(0)
