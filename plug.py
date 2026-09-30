@@ -1,65 +1,117 @@
 #!/usr/bin/env python3
-import pyemvue as pyem, sys, asyncio, json, os
+import pyemvue as pyem, sys, asyncio, json, os, time
 from kasa import Discover, Device
 action = None
-KASA_CACHE = os.path.join(os.path.dirname(__file__) or ".", "kasa_cache.json")
+BASE = os.path.dirname(__file__) or "."
+KASA_CACHE = os.path.join(BASE, "kasa_cache.json")
+TOKENS_FILE = os.path.join(BASE, "vue_tokens.json")
 
-with open(os.path.join(os.path.dirname(__file__) or ".", "keys.json")) as f:
+with open(os.path.join(BASE, "keys.json")) as f:
     creds = json.load(f)["emporia_vue"]
-
 v = pyem.PyEmVue()
-v.login(username=creds["username"], password=creds["password"])
 
-def load_cache():
+def load_json(path):
     try:
-        with open(KASA_CACHE) as f:
+        with open(path) as f:
             return json.load(f)
-    except:
+    except Exception:
         return None
 
-def save_cache(devices):
-    data = [{"host": d.host, "alias": d.alias} for d in devices]
-    with open(KASA_CACHE, "w") as f:
-        json.dump(data, f, indent=2)
+def fast_vue_auth(cached):
+    import jwt, types
+    from pyemvue.auth import Auth, USER_POOL_URL
+    from pyemvue.pyemvue import API_ROOT
+    exp = jwt.decode(cached["access_token"], options={"verify_signature": False}).get("exp") or 0
+    if exp < time.time() + 300:
+        return False
+    a = Auth.__new__(Auth)
+    a.host = API_ROOT
+    a.connect_timeout = v.connect_timeout
+    a.read_timeout = v.read_timeout
+    a.token_updater = None
+    a.max_retry_attempts = 5
+    a.initial_retry_delay = 0.5
+    a.max_retry_delay = 30.0
+    a.pool_wellknown_jwks = None
+    a._password = None
+    a.cognito = types.SimpleNamespace(user_pool_url=USER_POOL_URL)
+    a.tokens = {k: cached[k] for k in ("access_token", "id_token", "refresh_token")}
+    v.auth = a
+    return True
+
+def vue_devices():
+    """Return Emporia outlet devices, fast if cached tokens are still valid."""
+    try:
+        cached = load_json(TOKENS_FILE) or {}
+        if all(k in cached for k in ("id_token", "access_token", "refresh_token")) and fast_vue_auth(cached):
+            return [d for d in v.get_devices() if d.outlet is not None]
+    except Exception:
+        pass
+    if not v.login(username=creds["username"], password=creds["password"], token_storage_file=TOKENS_FILE):
+        raise RuntimeError("Emporia Vue login failed")
+    return [d for d in v.get_devices() if d.outlet is not None]
 
 def discover_kasa(force_rescan=False):
-    if not force_rescan:
-        cached = load_cache()
-        if cached:
-            async def connect_all():
-                result = []
-                for entry in cached:
-                    try:
-                        d = await Device.connect(host=entry["host"])
-                        await d.update()
-                        result.append(d)
-                    except:
-                        continue
-                return result
-            devices = asyncio.run(connect_all())
-            if devices:
-                return devices
-    try:
-        raw = asyncio.run(Discover.discover())
-        devices = list(raw.values())
-        save_cache(devices)
+    async def run():
+        cached = load_json(KASA_CACHE) or []
+
+        async def connect(entry):
+            try:
+                d = await Device.connect(host=entry["host"])
+                await d.update()
+                return d
+            except Exception:
+                return None
+
+        found = {}
+        for e, d in zip(cached, await asyncio.gather(*(connect(e) for e in cached))):
+            if d:
+                found[d.host] = d
+        raw = await Discover.discover(discovery_timeout=5, discovery_packets=2)
+        for d in raw.values():  # merge so a missed broadcast never evicts a known device
+            found.setdefault(d.host, d)
+
+        unnamed = [d.host for d in found.values() if not d.alias]
+        for host, d in zip(unnamed, await asyncio.gather(*(connect({"host": h}) for h in unnamed))):
+            if d:
+                found[host] = d
+
+        devices = sorted(found.values(), key=lambda d: [int(p) for p in d.host.split(".")])
+        with open(KASA_CACHE, "w") as f:
+            json.dump([{"host": d.host, "alias": d.alias} for d in devices], f, indent=2)
         return devices
-    except:
-        return []
+    return asyncio.run(run())
 
-rescan = "--rescan" in sys.argv
-if rescan:
-    sys.argv.remove("--rescan")
+def parse_namespace(argv):
+    if "-n" in argv or "--namespace" in argv:
+        fl = "--namespace" if "--namespace" in argv else "-n"
+        i = argv.index(fl) + 1
+        val = argv[i]
+        del argv[i:i + 2]
+        return [val.lower()]
+    return ["all"]
 
-devices = []
-for d in v.get_devices():
-    if d.outlet is not None:
-        devices.append(('vue', d))
-for p in discover_kasa(force_rescan=rescan):
-    devices.append(('kasa', p))
+argv = list(sys.argv[1:])
+namespace = parse_namespace(argv)
+
+def collect_devices(rescan=False):
+    async def run():
+        want_kasa = "kasa" in namespace or namespace == ["all"]
+        kasa_task = asyncio.to_thread(discover_kasa, rescan) if want_kasa else None
+        try:
+            vue_devs = [("vue", d) for d in vue_devices()]
+        except Exception as e:
+            print(f"  warning: emporia vue unavailable ({e})", file=sys.stderr)
+            vue_devs = []
+        kasa_devs = [("kasa", d) for d in await kasa_task] if kasa_task else []
+        alldevs = vue_devs + kasa_devs
+        return [d for d in alldevs if namespace == ["all"] or d[0] in namespace]
+    return asyncio.run(run())
+
+active = collect_devices()
 
 def toggle(which, action):
-    kind, obj = devices[which]
+    kind, obj = active[which]
     if kind == 'vue':
         state = not obj.outlet.outlet_on if action is None else (action == 'on')
         v.update_outlet(obj.outlet, state)
@@ -72,13 +124,25 @@ def toggle(which, action):
                 await (obj.turn_on() if action == 'on' else obj.turn_off())
         asyncio.run(_toggle())
 
+def close_kasa():
+    async def run():
+        for kind, obj in active:
+            if kind == 'kasa':
+                try:
+                    await obj.disconnect()
+                except Exception:
+                    pass
+    kasa_present = any(k == 'kasa' for k, _ in active)
+    if kasa_present:
+        asyncio.run(run())
+
 def rescanner():
-    global devices
+    global active
     print("Rescanning network for Kasa devices...")
     fresh = discover_kasa(force_rescan=True)
-    devices = [(k, o) for k, o in devices if k == 'vue']
-    for p in fresh:
-        devices.append(('kasa', p))
+    vue_devs = [(k, o) for k, o in active if k == 'vue']
+    alldevs = vue_devs + [("kasa", p) for p in fresh]
+    active = [d for d in alldevs if namespace == ["all"] or d[0] in namespace]
     show_dev()
 
 def process(i):
@@ -91,34 +155,33 @@ def process(i):
         rescanner()
     else:
         action = i
+        print(f"action set to {i}")
 
 def show_dev():
-    print()
     labels = {'vue': 'emporia', 'kasa': 'kasa'}
     last = None
-    for i, (kind, obj) in enumerate(devices):
+    for i, (kind, obj) in enumerate(active):
         if kind != last:
             print(f"  {labels[kind]}:")
             last = kind
-        if kind == 'vue':
-            on = obj.outlet.outlet_on
-            name = obj.device_name
-        else:
-            on = obj.is_on
-            name = obj.alias
-        print("    {} {} {}".format(i, '\u25A3' if on else '\u25A2', name))
-    print()
+        try:
+            on = bool(obj.outlet.outlet_on) if kind == 'vue' else bool(obj.is_on)
+        except Exception:
+            on = None  # not yet refreshed (fresh discovery); show neutral marker
+        name = obj.device_name if kind == 'vue' else (obj.alias or f"kasa@{obj.host}")
+        mark = '\u25A3' if on else ('\u25A1' if on is None else '\u25A2')
+        print("    {} {} {}".format(i, mark, name))
 
 show_dev()
 
-if len(sys.argv) > 1:
-    for i in sys.argv[1:]:
+if len(argv) > 1:
+    for i in argv:
         process(i)
-
-if len(sys.argv) == 1:
+else:
     while True:
         try:
             process(input("> "))
-        except:
+        except (EOFError, KeyboardInterrupt):
             print("\nAlright! Bye bye")
-            sys.exit(0)
+            break
+close_kasa()

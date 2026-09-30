@@ -1,2 +1,3 @@
 pyemvue
 python-kasa
+tzdata

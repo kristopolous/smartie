@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 keys.json
 kasa_cache.json
+vue_tokens.json
