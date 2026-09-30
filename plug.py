@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-import pyemvue as pyem, sys, asyncio, json, os, time
+import sys, asyncio, json, os, time
 from kasa import Discover, Device
 action = None
 BASE = os.path.dirname(__file__) or "."
 KASA_CACHE = os.path.join(BASE, "kasa_cache.json")
 TOKENS_FILE = os.path.join(BASE, "vue_tokens.json")
 
-with open(os.path.join(BASE, "keys.json")) as f:
-    creds = json.load(f)["emporia_vue"]
-v = pyem.PyEmVue()
+v = None
+creds = None
+pyem = None
+
+def _get_vue_client():
+    global v, creds, pyem
+    if v is None:
+        import pyemvue as pyem  # lazy: pyemvue drags in botocore (~1.9s)
+        v = pyem.PyEmVue()
+        with open(os.path.join(BASE, "keys.json")) as f:
+            creds = json.load(f)["emporia_vue"]
+    return v
 
 def load_json(path):
     try:
@@ -41,6 +50,7 @@ def fast_vue_auth(cached):
 
 def vue_devices():
     """Return Emporia outlet devices, fast if cached tokens are still valid."""
+    _get_vue_client()
     try:
         cached = load_json(TOKENS_FILE) or {}
         if all(k in cached for k in ("id_token", "access_token", "refresh_token")) and fast_vue_auth(cached):
@@ -53,30 +63,12 @@ def vue_devices():
 
 def discover_kasa(force_rescan=False):
     async def run():
-        cached = load_json(KASA_CACHE) or []
-
-        async def connect(entry):
-            try:
-                d = await Device.connect(host=entry["host"])
-                await d.update()
-                return d
-            except Exception:
-                return None
-
-        found = {}
-        for e, d in zip(cached, await asyncio.gather(*(connect(e) for e in cached))):
-            if d:
-                found[d.host] = d
-        raw = await Discover.discover(discovery_timeout=5, discovery_packets=2)
-        for d in raw.values():  # merge so a missed broadcast never evicts a known device
-            found.setdefault(d.host, d)
-
-        unnamed = [d.host for d in found.values() if not d.alias]
-        for host, d in zip(unnamed, await asyncio.gather(*(connect({"host": h}) for h in unnamed))):
-            if d:
-                found[host] = d
-
-        devices = sorted(found.values(), key=lambda d: [int(p) for p in d.host.split(".")])
+        # The broadcast itself carries live on-state for the controllable (IOT)
+        # plugs, so no follow-up connect is needed. A forced rescan (r) uses a
+        # longer window to sweep the subnet more thoroughly.
+        timeout = 5 if force_rescan else 1
+        raw = await Discover.discover(discovery_timeout=timeout, discovery_packets=2)
+        devices = sorted(raw.values(), key=lambda d: [int(p) for p in d.host.split(".")])
         with open(KASA_CACHE, "w") as f:
             json.dump([{"host": d.host, "alias": d.alias} for d in devices], f, indent=2)
         return devices
@@ -97,15 +89,16 @@ namespace = parse_namespace(argv)
 def collect_devices(rescan=False):
     async def run():
         want_kasa = "kasa" in namespace or namespace == ["all"]
+        want_vue = "vue" in namespace or namespace == ["all"]
         kasa_task = asyncio.to_thread(discover_kasa, rescan) if want_kasa else None
+        vue_task = asyncio.to_thread(vue_devices) if want_vue else None
         try:
-            vue_devs = [("vue", d) for d in vue_devices()]
+            vue_devs = [("vue", d) for d in await vue_task] if vue_task else []
         except Exception as e:
             print(f"  warning: emporia vue unavailable ({e})", file=sys.stderr)
             vue_devs = []
         kasa_devs = [("kasa", d) for d in await kasa_task] if kasa_task else []
-        alldevs = vue_devs + kasa_devs
-        return [d for d in alldevs if namespace == ["all"] or d[0] in namespace]
+        return kasa_devs + vue_devs
     return asyncio.run(run())
 
 active = collect_devices()
