@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import sys, asyncio, json, os, time
-from kasa import Discover, Device
 action = None
 BASE = os.path.dirname(__file__) or "."
 KASA_CACHE = os.path.join(BASE, "kasa_cache.json")
@@ -9,6 +8,7 @@ TOKENS_FILE = os.path.join(BASE, "vue_tokens.json")
 v = None
 creds = None
 pyem = None
+_kasa_cred = None
 
 def _get_vue_client():
     global v, creds, pyem
@@ -61,14 +61,62 @@ def vue_devices():
         raise RuntimeError("Emporia Vue login failed")
     return [d for d in v.get_devices() if d.outlet is not None]
 
+def _broadcasts():
+    """Per-interface broadcast addresses. On hosts whose default route is not
+    the LAN (e.g. cellular), the default 255.255.255.255 leaves the wrong
+    interface, so we target each real interface broadcast explicitly."""
+    import socket, struct, fcntl
+    out = set()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _idx, name in socket.if_nameindex():
+            try:
+                b = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8919, struct.pack("256s", name.encode()))[20:24])
+            except Exception:
+                continue
+            if b not in ("0.0.0.0", "127.0.0.1"):
+                out.add(b)
+    finally:
+        s.close()
+    return sorted(out) or ["255.255.255.255"]
+
 def discover_kasa(force_rescan=False):
     async def run():
-        # The broadcast itself carries live on-state for the controllable (IOT)
-        # plugs, so no follow-up connect is needed. A forced rescan (r) uses a
-        # longer window to sweep the subnet more thoroughly.
-        timeout = 5 if force_rescan else 1
-        raw = await Discover.discover(discovery_timeout=timeout, discovery_packets=2)
-        devices = sorted(raw.values(), key=lambda d: [int(p) for p in d.host.split(".")])
+        from kasa import Discover, Device, DeviceConfig, Credentials  # lazy: kasa import is slow
+        # Broadcast enumerate the plug IPs. A forced rescan (r) uses a longer
+        # window to sweep the subnet more thoroughly.
+        timeout = 5 if force_rescan else 2
+        results = await asyncio.gather(*(
+            Discover.discover(target=t, discovery_timeout=timeout, discovery_packets=4)
+            for t in _broadcasts()
+        ), return_exceptions=True)
+        found = {}
+        for raw in results:
+            if isinstance(raw, Exception):
+                continue
+            for d in raw.values():
+                dt = str(getattr(d, "device_type", ""))
+                # this is a plug script; skip cameras/hubs/etc
+                if "Plug" not in dt and "Bulb" not in dt:
+                    continue
+                found.setdefault(d.host, d)
+        # The broadcast is unreliable for name/on-state on KLAP (EP10) plugs, so
+        # auth-connect each one in parallel for a guaranteed alias, live state,
+        # and a controllable object. Creds are only needed here, not at runtime.
+        global _kasa_cred
+        kasa_creds = (load_json(os.path.join(BASE, "keys.json")) or {}).get("tplink_kasa") or {}
+        if kasa_creds:
+            _kasa_cred = Credentials(username=kasa_creds["username"], password=kasa_creds["password"])
+            cred = _kasa_cred
+            async def conn(host):
+                try:
+                    dev = await Device.connect(config=DeviceConfig(host=host, credentials=cred, timeout=8))
+                    await dev.update()
+                    return dev
+                except Exception:
+                    return found[host]
+            found = dict(zip(found, await asyncio.gather(*(conn(h) for h in found))))
+        devices = sorted(found.values(), key=lambda d: (0 if "Plug" in str(d.device_type) else 1, [int(p) for p in d.host.split(".")]))
         with open(KASA_CACHE, "w") as f:
             json.dump([{"host": d.host, "alias": d.alias} for d in devices], f, indent=2)
         return devices
@@ -109,12 +157,24 @@ def toggle(which, action):
         state = not obj.outlet.outlet_on if action is None else (action == 'on')
         v.update_outlet(obj.outlet, state)
     else:
+        from kasa import Device, DeviceConfig  # lazy
         async def _toggle():
-            if action is None:
-                await obj.update()
-                await (obj.turn_off() if obj.is_on else obj.turn_on())
+            if _kasa_cred is None:
+                dev, own = obj, False
             else:
-                await (obj.turn_on() if action == 'on' else obj.turn_off())
+                # Discovery objects are bound to a closed event loop, so reconnect
+                # fresh in this loop (by host) to issue the command reliably.
+                dev = await Device.connect(config=DeviceConfig(host=obj.host, credentials=_kasa_cred, timeout=8))
+                own = True
+            try:
+                if action is None:
+                    await dev.update()
+                    await (dev.turn_off() if dev.is_on else dev.turn_on())
+                else:
+                    await (dev.turn_on() if action == 'on' else dev.turn_off())
+            finally:
+                if own:
+                    await dev.disconnect()
         asyncio.run(_toggle())
 
 def close_kasa():
@@ -154,9 +214,18 @@ def show_dev():
     labels = {'vue': 'emporia', 'kasa': 'kasa'}
     last = None
     for i, (kind, obj) in enumerate(active):
-        if kind != last:
-            print(f"  {labels[kind]}:")
-            last = kind
+        if kind == 'kasa':
+            section = "smart bulbs" if "Bulb" in str(getattr(obj, "device_type", "")) else "smart plugs"
+        else:
+            section = labels[kind]
+        if section != last:
+            if last is not None:
+                print()
+            if kind == 'kasa':
+                print(f"  {section}")
+            else:
+                print(f"  {section}:")
+            last = section
         try:
             on = bool(obj.outlet.outlet_on) if kind == 'vue' else bool(obj.is_on)
         except Exception:
